@@ -1,0 +1,984 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AI-Powered Event-Driven EKS AMI Update with GitOps and Karpenter.
+  Deploys the full pipeline: Amazon EventBridge, AWS Lambda functions, AWS Step Functions,
+  Amazon Simple Notification Service (Amazon SNS), and AWS Secrets Manager.
+  Detects new EKS AMIs, analyzes them with Amazon Bedrock, sends a notification email,
+  and opens a GitHub pull request for human review and merge.
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address for AMI update notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+
+  GitHubAppId:
+    Type: String
+    Description: GitHub App ID (found in the app's General settings)
+
+  GitHubAppInstallationId:
+    Type: String
+    Description: GitHub App Installation ID (from the app's installation URL)
+
+  GitHubAppPrivateKey:
+    Type: String
+    NoEcho: true
+    Description: GitHub App private key (PEM format, base64-encoded for safe transport)
+
+  GitHubRepoOwner:
+    Type: String
+    Description: GitHub repository owner
+
+  GitHubRepoName:
+    Type: String
+    Description: GitHub repository name
+
+  GitHubFilePath:
+    Type: String
+    Description: Path to the Karpenter nodeclass YAML in the repo
+
+  GitHubBranch:
+    Type: String
+    Description: GitHub base branch for pull requests
+    Default: main
+
+  EKSVersion:
+    Type: String
+    Description: EKS version to monitor for AMI updates
+    Default: '1.34'
+
+  PollingSchedule:
+    Type: String
+    Description: EventBridge cron schedule for AMI polling
+    Default: cron(0 9,21 * * ? *)
+
+Resources:
+  # ============================================================
+  # Amazon Bedrock Guardrail
+  # ============================================================
+  # Model us.anthropic.claude-3-5-haiku-20241022-v1:0 is a pre-approved model
+  # available through the Amazon Bedrock marketplace, verified for use in AWS solutions.
+  AmazonBedrockGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: eks-ami-analysis-guardrail
+      Description: Content filtering guardrail for Amazon Bedrock AMI analysis
+      BlockedInputMessaging: Input blocked by content filter.
+      BlockedOutputsMessaging: Output blocked by content filter.
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: SEXUAL
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: VIOLENCE
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: HATE
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: INSULTS
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: MISCONDUCT
+            InputStrength: HIGH
+            OutputStrength: HIGH
+          - Type: PROMPT_ATTACK
+            InputStrength: HIGH
+            OutputStrength: NONE
+
+  AmazonBedrockGuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt AmazonBedrockGuardrail.GuardrailArn
+      Description: Published version for Amazon Bedrock AMI analysis
+
+  # ============================================================
+  # Secrets Manager
+  # ============================================================
+  GitHubAppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: eks-ami-github-app
+      Description: GitHub App credentials for EKS AMI GitOps pipeline
+      SecretString: !Sub '{"app_id":"${GitHubAppId}","installation_id":"${GitHubAppInstallationId}","private_key":"${GitHubAppPrivateKey}"}'
+
+  # ============================================================
+  # Amazon Simple Notification Service (Amazon SNS) Topic
+  # ============================================================
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: eks-ami-notifications
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ============================================================
+  # AWS Identity and Access Management (AWS IAM) Roles
+  # (per-function least privilege)
+  # ============================================================
+  DetectorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EKS-AMI-Detector-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DetectorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eks-ami-detector:*
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:*:parameter/aws/service/eks/optimized-ami/*
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref GitHubAppSecret
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:eks-ami-update-workflow
+
+  BedrockAnalyzerFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "bedrock:InvokeModel requires Resource '*' for cross-region inference profiles (us. prefix). Scoping to a specific model ARN causes AccessDenied when requests route across regions."
+    Properties:
+      RoleName: EKS-AMI-AmazonBedrockAnalyzer-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AmazonBedrockAnalyzerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eks-ami-amazon-bedrock-analyzer:*
+              # Resource: '*' is required for cross-region inference profiles (us. prefix).
+              # Scoping to a specific model ARN causes AccessDenied when requests route across regions.
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:ApplyGuardrail
+                Resource: !GetAtt AmazonBedrockGuardrail.GuardrailArn
+
+  SendNotificationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EKS-AMI-SendNotification-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SendNotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eks-ami-send-notification:*
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  GitOpsUpdaterFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EKS-AMI-GitOpsUpdater-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GitOpsUpdaterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/eks-ami-gitops-updater:*
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref GitHubAppSecret
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EKS-AMI-StepFunctions-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EKS-AMI-StepFunctions-Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt BedrockAnalyzerFunction.Arn
+                  - !GetAtt SendNotificationFunction.Arn
+                  - !GetAtt GitOpsUpdaterFunction.Arn
+
+  # ============================================================
+  # Lambda Functions
+  # ============================================================
+  DetectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: eks-ami-detector
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt DetectorFunctionRole.Arn
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          STEP_FUNCTION_ARN: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:eks-ami-update-workflow
+          PARAMETER_NAME: !Sub /aws/service/eks/optimized-ami/${EKSVersion}/amazon-linux-2023/x86_64/standard/recommended/image_id
+          GITHUB_REPO_OWNER: !Ref GitHubRepoOwner
+          GITHUB_REPO_NAME: !Ref GitHubRepoName
+          GITHUB_FILE_PATH: !Ref GitHubFilePath
+          GITHUB_BRANCH: !Ref GitHubBranch
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import re
+          import base64
+          import hashlib
+          import hmac
+          import struct
+          import time
+          import urllib.request
+          import urllib.parse
+
+          ssm = boto3.client('ssm')
+          sfn = boto3.client('stepfunctions')
+          secretsmanager = boto3.client('secretsmanager')
+
+          # ---- Minimal RS256 JWT (no third-party libraries) ----
+
+          def b64url(data):
+              return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
+
+          def int_to_bytes(n):
+              length = (n.bit_length() + 7) // 8
+              return n.to_bytes(length, 'big')
+
+          def parse_pem_private_key(pem_text):
+              pem_text = pem_text.strip()
+              lines = [l for l in pem_text.splitlines() if not l.startswith('-----')]
+              der = base64.b64decode(''.join(lines))
+              return parse_pkcs1_or_pkcs8(der)
+
+          def parse_pkcs1_or_pkcs8(der):
+              try:
+                  return parse_rsa_private_key_pkcs1(der)
+              except Exception:
+                  idx = 0
+                  tag, length, idx = read_asn1(der, idx)
+                  end = idx + length
+                  _, _, idx = read_asn1(der, idx)
+                  _, _, idx = read_asn1(der, idx)
+                  tag, length, idx = read_asn1(der, idx)
+                  if der[idx] == 0x00:
+                      idx += 1
+                  return parse_rsa_private_key_pkcs1(der[idx:idx+length-1] if der[idx-length] != 0x00 else der[idx:])
+
+          def read_asn1(data, idx):
+              tag = data[idx]; idx += 1
+              length = data[idx]; idx += 1
+              if length & 0x80:
+                  num_bytes = length & 0x7f
+                  length = int.from_bytes(data[idx:idx+num_bytes], 'big')
+                  idx += num_bytes
+              return tag, length, idx
+
+          def read_asn1_integer(data, idx):
+              tag, length, idx = read_asn1(data, idx)
+              value = int.from_bytes(data[idx:idx+length], 'big')
+              return value, idx + length
+
+          def parse_rsa_private_key_pkcs1(der):
+              idx = 0
+              tag, length, idx = read_asn1(der, idx)
+              _, idx = read_asn1_integer(der, idx)  # version
+              n, idx = read_asn1_integer(der, idx)
+              e, idx = read_asn1_integer(der, idx)
+              d, idx = read_asn1_integer(der, idx)
+              p, idx = read_asn1_integer(der, idx)
+              q, idx = read_asn1_integer(der, idx)
+              return {'n': n, 'e': e, 'd': d, 'p': p, 'q': q}
+
+          def rsa_sign(message_bytes, key):
+              digest = hashlib.sha256(message_bytes).digest()
+              digest_info = (
+                  b'\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20'
+                  + digest
+              )
+              n = key['n']
+              d = key['d']
+              k = (n.bit_length() + 7) // 8
+              pad_len = k - len(digest_info) - 3
+              em = b'\x00\x01' + (b'\xff' * pad_len) + b'\x00' + digest_info
+              m = int.from_bytes(em, 'big')
+              # CRT optimization
+              p, q = key['p'], key['q']
+              dp = d % (p - 1)
+              dq = d % (q - 1)
+              qinv = pow(q, -1, p)
+              m1 = pow(m % p, dp, p)
+              m2 = pow(m % q, dq, q)
+              h = (qinv * (m1 - m2)) % p
+              s = m2 + h * q
+              return int_to_bytes(s).rjust(k, b'\x00')
+
+          def create_jwt(app_id, private_key_pem):
+              now = int(time.time())
+              header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+              payload = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": str(app_id)}).encode())
+              signing_input = f"{header}.{payload}".encode('ascii')
+              key = parse_pem_private_key(private_key_pem)
+              signature = b64url(rsa_sign(signing_input, key))
+              return f"{header}.{payload}.{signature}"
+
+          def get_installation_token(app_id, installation_id, private_key_pem):
+              jwt = create_jwt(app_id, private_key_pem)
+              url = f'https://api.github.com/app/installations/{installation_id}/access_tokens'
+              req = urllib.request.Request(url, data=b'{}', headers={
+                  'Authorization': f'Bearer {jwt}',
+                  'Accept': 'application/vnd.github.v3+json',
+                  'User-Agent': 'eks-ami-detector'
+              }, method='POST')
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read().decode('utf-8'))['token']
+
+          def get_github_token():
+              secret = secretsmanager.get_secret_value(SecretId='eks-ami-github-app')
+              creds = json.loads(secret['SecretString'])
+              private_key_pem = base64.b64decode(creds['private_key']).decode('utf-8')
+              return get_installation_token(creds['app_id'], creds['installation_id'], private_key_pem)
+
+          def get_deployed_ami():
+              git_token = get_github_token()
+              repo_owner = os.environ['GITHUB_REPO_OWNER']
+              repo_name = os.environ['GITHUB_REPO_NAME']
+              file_path = os.environ['GITHUB_FILE_PATH']
+              branch = os.environ['GITHUB_BRANCH']
+              url = f'https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{file_path}?ref={urllib.parse.quote(branch, safe="")}'
+              req = urllib.request.Request(url, headers={
+                  'Authorization': f'token {git_token}',
+                  'Accept': 'application/vnd.github.v3+json',
+                  'User-Agent': 'eks-ami-detector'
+              })
+              with urllib.request.urlopen(req) as resp:
+                  data = json.loads(resp.read().decode('utf-8'))
+              content = base64.b64decode(data['content']).decode('utf-8')
+              match = re.search(r'- id: (ami-[a-z0-9]+)', content)
+              return match.group(1) if match else None
+
+          def lambda_handler(event, context):
+              parameter_name = os.environ['PARAMETER_NAME']
+
+              response = ssm.get_parameter(Name=parameter_name)
+              current_ami = response['Parameter']['Value']
+              print(f"Current AMI in SSM: {current_ami}")
+
+              deployed_ami = get_deployed_ami()
+              print(f"Deployed AMI in Git: {deployed_ami}")
+
+              if current_ami != deployed_ami:
+                  print(f"NEW AMI DETECTED: {deployed_ami} -> {current_ami}")
+                  sfn.start_execution(
+                      stateMachineArn=os.environ['STEP_FUNCTION_ARN'],
+                      input=json.dumps({
+                          'ami_id': current_ami,
+                          'parameter_name': parameter_name,
+                          'previous_ami': deployed_ami
+                      })
+                  )
+                  return {'statusCode': 200, 'message': 'New AMI detected, workflow started'}
+              else:
+                  print("No change detected")
+                  return {'statusCode': 200, 'message': 'No change'}
+
+  BedrockAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: eks-ami-amazon-bedrock-analyzer
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockAnalyzerFunctionRole.Arn
+      Timeout: 90
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          GUARDRAIL_ID: !GetAtt AmazonBedrockGuardrail.GuardrailId
+          GUARDRAIL_VERSION: !GetAtt AmazonBedrockGuardrailVersion.Version
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+          import boto3
+          import urllib.request
+
+          bedrock = boto3.client('bedrock-runtime')
+
+          def fetch_release_notes():
+              url = 'https://api.github.com/repos/awslabs/amazon-eks-ami/releases?per_page=5'
+              req = urllib.request.Request(url, headers={
+                  'Accept': 'application/vnd.github.v3+json',
+                  'User-Agent': 'eks-ami-updater'
+              })
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      releases = json.loads(resp.read().decode('utf-8'))
+                  notes = []
+                  for r in releases[:3]:
+                      notes.append(f"Release: {r.get('name', r.get('tag_name', 'unknown'))}\n{r.get('body', 'No notes')}")
+                  return '\n\n---\n\n'.join(notes)
+              except Exception as e:
+                  print(f"Failed to fetch release notes: {e}")
+                  return 'Release notes unavailable'
+
+          def lambda_handler(event, context):
+              ami_id = event['ami_id']
+              parameter_name = event['parameter_name']
+              previous_ami = event.get('previous_ami', 'None')
+              print(f"Analyzing AMI: {ami_id}")
+
+              release_notes = fetch_release_notes()
+              print(f"Fetched release notes length: {len(release_notes)}")
+
+              prompt = f"""Analyze this Amazon EKS AMI update using the actual release notes below.
+
+          New AMI ID: {ami_id}
+          Previous AMI ID: {previous_ami}
+          SSM Parameter: {parameter_name}
+
+          ACTUAL EKS AMI RELEASE NOTES (from github.com/awslabs/amazon-eks-ami/releases):
+          {release_notes}
+
+          Based on the actual release notes above, provide your analysis in JSON format:
+          {{
+            "risk_score": 1-10,
+            "recommendation": "APPROVE or REJECT",
+            "summary": "brief one-line summary of actual changes",
+            "pr_description": "a detailed markdown PR description with: actual changes from release notes, CVEs patched, package versions updated, risk assessment, and review guidance"
+          }}"""
+
+              body = json.dumps({
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 2000,
+                  "messages": [{"role": "user", "content": prompt}]
+              })
+
+              response = bedrock.invoke_model(
+                  modelId='us.anthropic.claude-3-5-haiku-20241022-v1:0',
+                  body=body,
+                  guardrailIdentifier=os.environ['GUARDRAIL_ID'],
+                  guardrailVersion=os.environ['GUARDRAIL_VERSION']
+              )
+
+              response_body = json.loads(response['body'].read())
+              analysis_text = response_body['content'][0]['text']
+              print(f"Amazon Bedrock Analysis: {analysis_text}")
+
+              def extract_field(text, field):
+                  match = re.search(rf'"{field}"\s*:\s*"([^"]+)"', text)
+                  if match:
+                      return match.group(1)
+                  match = re.search(rf'"{field}"\s*:\s*(\d+)', text)
+                  return int(match.group(1)) if match else None
+
+              risk_score = extract_field(analysis_text, 'risk_score') or 'N/A'
+              recommendation = extract_field(analysis_text, 'recommendation') or 'N/A'
+              summary = extract_field(analysis_text, 'summary') or 'N/A'
+
+              pr_desc = ''
+              pr_match = re.search(r'"pr_description"\s*:\s*"', analysis_text)
+              if pr_match:
+                  rest = analysis_text[pr_match.end():]
+                  if rest.rstrip().endswith('"\n}'):
+                      pr_desc = rest.rstrip()[:-3]
+                  elif rest.rstrip().endswith('}'):
+                      last_quote = rest.rstrip().rfind('"')
+                      pr_desc = rest[:last_quote] if last_quote > 0 else rest
+                  else:
+                      pr_desc = rest
+
+              return {
+                  'statusCode': 200,
+                  'analysis': analysis_text,
+                  'risk_score': risk_score,
+                  'recommendation': recommendation,
+                  'summary': summary,
+                  'pr_description': pr_desc.strip(),
+                  'ami_id': ami_id
+              }
+
+  SendNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: eks-ami-send-notification
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt SendNotificationFunctionRole.Arn
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              ami_id = event['ami_id']
+              parameter_name = event['parameter_name']
+              previous_ami = event.get('previous_ami', 'None')
+
+              analysis = event.get('analysis', {}).get('Payload', {})
+              risk_score = analysis.get('risk_score', 'N/A')
+              recommendation = analysis.get('recommendation', 'N/A')
+              summary = analysis.get('summary', 'N/A')
+              pr_description = analysis.get('pr_description', '')
+
+              pr_payload = event.get('pullRequest', {}).get('Payload', {})
+              pr_url = pr_payload.get('pr_url', 'N/A')
+              pr_number = pr_payload.get('pr_number', 'N/A')
+
+              message = f"""NEW EKS AMI DETECTED — PULL REQUEST OPENED
+          ============================================================
+
+          AMI Details
+          -----------
+          New AMI ID:      {ami_id}
+          Previous AMI ID: {previous_ami}
+          SSM Parameter:   {parameter_name}
+          Detected At:     {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}
+
+          Amazon Bedrock AI Analysis
+          --------------------------
+          Risk Score:     {risk_score}/10
+          Recommendation: {recommendation}
+          Summary:        {summary}
+
+          {pr_description}
+
+          Action Required
+          ---------------
+          A pull request has been opened with the AMI update.
+          Review the full AI analysis and changelog in the PR description:
+          PR #{pr_number}: {pr_url}
+
+          After merge, Argo CD should sync the changes and Karpenter
+          should roll out new nodes with the updated AMI.
+          """
+
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Subject=f'EKS AMI Update PR #{pr_number}: {ami_id}',
+                  Message=message
+              )
+
+              return {
+                  'statusCode': 200,
+                  'ami_id': ami_id,
+                  'pr_url': pr_url,
+                  'pr_number': pr_number
+              }
+
+  GitOpsUpdaterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: eks-ami-gitops-updater
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt GitOpsUpdaterFunctionRole.Arn
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          GITHUB_REPO_OWNER: !Ref GitHubRepoOwner
+          GITHUB_REPO_NAME: !Ref GitHubRepoName
+          GITHUB_FILE_PATH: !Ref GitHubFilePath
+          GITHUB_BRANCH: !Ref GitHubBranch
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import hashlib
+          import os
+          import time
+          import urllib.request
+          import urllib.parse
+          import uuid
+          import re
+          from datetime import datetime, timezone
+
+          secretsmanager = boto3.client('secretsmanager')
+
+          # ---- Minimal RS256 JWT (no third-party libraries) ----
+
+          def b64url(data):
+              return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
+
+          def int_to_bytes(n):
+              length = (n.bit_length() + 7) // 8
+              return n.to_bytes(length, 'big')
+
+          def parse_pem_private_key(pem_text):
+              pem_text = pem_text.strip()
+              lines = [l for l in pem_text.splitlines() if not l.startswith('-----')]
+              der = base64.b64decode(''.join(lines))
+              return parse_pkcs1_or_pkcs8(der)
+
+          def parse_pkcs1_or_pkcs8(der):
+              try:
+                  return parse_rsa_private_key_pkcs1(der)
+              except Exception:
+                  idx = 0
+                  tag, length, idx = read_asn1(der, idx)
+                  end = idx + length
+                  _, _, idx = read_asn1(der, idx)
+                  _, _, idx = read_asn1(der, idx)
+                  tag, length, idx = read_asn1(der, idx)
+                  if der[idx] == 0x00:
+                      idx += 1
+                  return parse_rsa_private_key_pkcs1(der[idx:idx+length-1] if der[idx-length] != 0x00 else der[idx:])
+
+          def read_asn1(data, idx):
+              tag = data[idx]; idx += 1
+              length = data[idx]; idx += 1
+              if length & 0x80:
+                  num_bytes = length & 0x7f
+                  length = int.from_bytes(data[idx:idx+num_bytes], 'big')
+                  idx += num_bytes
+              return tag, length, idx
+
+          def read_asn1_integer(data, idx):
+              tag, length, idx = read_asn1(data, idx)
+              value = int.from_bytes(data[idx:idx+length], 'big')
+              return value, idx + length
+
+          def parse_rsa_private_key_pkcs1(der):
+              idx = 0
+              tag, length, idx = read_asn1(der, idx)
+              _, idx = read_asn1_integer(der, idx)  # version
+              n, idx = read_asn1_integer(der, idx)
+              e, idx = read_asn1_integer(der, idx)
+              d, idx = read_asn1_integer(der, idx)
+              p, idx = read_asn1_integer(der, idx)
+              q, idx = read_asn1_integer(der, idx)
+              return {'n': n, 'e': e, 'd': d, 'p': p, 'q': q}
+
+          def rsa_sign(message_bytes, key):
+              digest = hashlib.sha256(message_bytes).digest()
+              digest_info = (
+                  b'\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20'
+                  + digest
+              )
+              n = key['n']
+              d = key['d']
+              k = (n.bit_length() + 7) // 8
+              pad_len = k - len(digest_info) - 3
+              em = b'\x00\x01' + (b'\xff' * pad_len) + b'\x00' + digest_info
+              m = int.from_bytes(em, 'big')
+              # CRT optimization
+              p, q = key['p'], key['q']
+              dp = d % (p - 1)
+              dq = d % (q - 1)
+              qinv = pow(q, -1, p)
+              m1 = pow(m % p, dp, p)
+              m2 = pow(m % q, dq, q)
+              h = (qinv * (m1 - m2)) % p
+              s = m2 + h * q
+              return int_to_bytes(s).rjust(k, b'\x00')
+
+          def create_jwt(app_id, private_key_pem):
+              now = int(time.time())
+              header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+              payload = b64url(json.dumps({"iat": now - 60, "exp": now + 540, "iss": str(app_id)}).encode())
+              signing_input = f"{header}.{payload}".encode('ascii')
+              key = parse_pem_private_key(private_key_pem)
+              signature = b64url(rsa_sign(signing_input, key))
+              return f"{header}.{payload}.{signature}"
+
+          def get_installation_token(app_id, installation_id, private_key_pem):
+              jwt = create_jwt(app_id, private_key_pem)
+              url = f'https://api.github.com/app/installations/{installation_id}/access_tokens'
+              req = urllib.request.Request(url, data=b'{}', headers={
+                  'Authorization': f'Bearer {jwt}',
+                  'Accept': 'application/vnd.github.v3+json',
+                  'User-Agent': 'eks-ami-gitops-updater'
+              }, method='POST')
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read().decode('utf-8'))['token']
+
+          def get_github_token():
+              secret = secretsmanager.get_secret_value(SecretId='eks-ami-github-app')
+              creds = json.loads(secret['SecretString'])
+              private_key_pem = base64.b64decode(creds['private_key']).decode('utf-8')
+              return get_installation_token(creds['app_id'], creds['installation_id'], private_key_pem)
+
+          def github_api(url, headers, method='GET', data=None):
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(data).encode('utf-8') if data else None,
+                  headers=headers,
+                  method=method
+              )
+              with urllib.request.urlopen(req) as resp:
+                  body = resp.read().decode('utf-8')
+                  return (json.loads(body) if body else {}), resp.status
+
+          def lambda_handler(event, context):
+              ami_id = event['ami_id']
+              parameter_name = event['parameter_name']
+              previous_ami = event.get('previous_ami', 'None')
+
+              analysis = event.get('analysis', {}).get('Payload', {})
+              risk_score = analysis.get('risk_score', 'N/A')
+              recommendation = analysis.get('recommendation', 'N/A')
+              summary = analysis.get('summary', '')
+              pr_description = analysis.get('pr_description', analysis.get('analysis', ''))
+
+              git_token = get_github_token()
+
+              repo_owner = os.environ['GITHUB_REPO_OWNER']
+              repo_name = os.environ['GITHUB_REPO_NAME']
+              file_path = os.environ['GITHUB_FILE_PATH']
+              base_branch = os.environ['GITHUB_BRANCH']
+              api_base = f'https://api.github.com/repos/{repo_owner}/{repo_name}'
+
+              headers = {
+                  'Authorization': f'token {git_token}',
+                  'Accept': 'application/vnd.github.v3+json',
+                  'Content-Type': 'application/json'
+              }
+
+              # Get base branch SHA
+              ref_data, _ = github_api(f'{api_base}/git/ref/heads/{urllib.parse.quote(base_branch, safe="")}', headers)
+              base_sha = ref_data['object']['sha']
+
+              # Create feature branch with unique suffix
+              short_id = uuid.uuid4().hex[:8]
+              branch_name = f'ami-update/{ami_id}-{short_id}'
+              github_api(f'{api_base}/git/refs', headers, method='POST', data={
+                  'ref': f'refs/heads/{branch_name}',
+                  'sha': base_sha
+              })
+
+              # Get current file content from base branch
+              file_url = f'{api_base}/contents/{file_path}?ref={urllib.parse.quote(base_branch, safe="")}'
+              file_data, _ = github_api(file_url, headers)
+              current_content = base64.b64decode(file_data['content']).decode('utf-8')
+              updated_content = update_ami_in_yaml(current_content, ami_id)
+
+              # Commit to feature branch
+              commit_message = f'Update EKS AMI to {ami_id}'
+              github_api(f'{api_base}/contents/{file_path}', headers, method='PUT', data={
+                  'message': commit_message,
+                  'content': base64.b64encode(updated_content.encode('utf-8')).decode('utf-8'),
+                  'sha': file_data['sha'],
+                  'branch': branch_name
+              })
+
+              # Open pull request
+              now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+              pr_body = f"""## EKS AMI Update: {previous_ami} → {ami_id}
+
+          **SSM Parameter**: `{parameter_name}`
+          **Detected**: {now}
+          **Automated by**: EKS AMI GitOps Pipeline
+
+          | Field | Value |
+          |-------|-------|
+          | Risk Score | {risk_score}/10 |
+          | Recommendation | {recommendation} |
+          | Summary | {summary} |
+
+          ---
+
+          {pr_description}
+
+          ---
+
+          > This PR was automatically generated. Review the changes and merge to apply the AMI update.
+          > After merge, Argo CD should sync the changes and Karpenter should roll out new nodes.
+          """
+
+              pr_data, _ = github_api(f'{api_base}/pulls', headers, method='POST', data={
+                  'title': f'EKS AMI Update: {ami_id}',
+                  'body': pr_body,
+                  'head': branch_name,
+                  'base': base_branch
+              })
+
+              print(f"PR created: {pr_data['html_url']}")
+              return {
+                  'statusCode': 200,
+                  'pr_url': pr_data['html_url'],
+                  'pr_number': pr_data['number'],
+                  'ami_id': ami_id
+              }
+
+          def update_ami_in_yaml(yaml_content, new_ami_id):
+              lines = yaml_content.split('\n')
+              updated_lines = []
+              for line in lines:
+                  if '- id: ami-' in line:
+                      indent = line.split('- id:')[0]
+                      updated_lines.append(f'{indent}- id: {new_ami_id}')
+                  else:
+                      updated_lines.append(line)
+              return '\n'.join(updated_lines)
+
+  # ============================================================
+  # Step Functions State Machine
+  # ============================================================
+  AMIUpdateStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: eks-ami-update-workflow
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "EKS AMI Update Workflow — Analyze, Create PR, Notify",
+          "StartAt": "BedrockAnalysis",
+          "States": {
+            "BedrockAnalysis": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${BedrockAnalyzerFunction.Arn}",
+                "Payload.$": "$"
+              },
+              "ResultPath": "$.analysis",
+              "Next": "CreatePullRequest"
+            },
+            "CreatePullRequest": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${GitOpsUpdaterFunction.Arn}",
+                "Payload.$": "$"
+              },
+              "ResultPath": "$.pullRequest",
+              "Next": "SendNotification"
+            },
+            "SendNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${SendNotificationFunction.Arn}",
+                "Payload.$": "$"
+              },
+              "End": true
+            }
+          }
+        }
+
+  # ============================================================
+  # EventBridge Scheduled Rule
+  # ============================================================
+  AMIDetectionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: eks-ami-twice-daily-check
+      Description: Polls for new EKS AMI releases
+      ScheduleExpression: !Ref PollingSchedule
+      State: ENABLED
+      Targets:
+        - Id: DetectorLambdaTarget
+          Arn: !GetAtt DetectorFunction.Arn
+
+  DetectorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DetectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AMIDetectionSchedule.Arn
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref AMIUpdateStateMachine
+
+  SNSTopicArn:
+    Description: Amazon SNS topic ARN for notifications
+    Value: !Ref NotificationTopic
+
+  DetectorFunctionArn:
+    Description: Detector Lambda function ARN
+    Value: !GetAtt DetectorFunction.Arn
+
+  GitHubAppSecretArn:
+    Description: Secrets Manager ARN for GitHub App credentials
+    Value: !Ref GitHubAppSecret
