@@ -1,0 +1,17 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  amiFamily: AL2023
+  role: "KarpenterNodeRole-eks-ami-demo"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "eks-ami-demo"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "eks-ami-demo"
+  # Pinned AMI ID — this is the field the EKS AMI updater pipeline modifies via PR.
+  # Initialized to N-1 (v20260610) so the detector sees a diff vs the latest SSM AMI and opens a PR.
+  amiSelectorTerms:
+    - id: ami-0a12ac64685c1795c
