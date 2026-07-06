@@ -14,4 +14,4 @@ spec:
   # Pinned AMI ID — this is the field the EKS AMI updater pipeline modifies via PR.
   # Initialized to N-1 (v20260610) so the detector sees a diff vs the latest SSM AMI and opens a PR.
   amiSelectorTerms:
-    - id: ami-0a12ac64685c1795c
+    - id: ami-0cd4f51323a764d21
